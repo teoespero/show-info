@@ -1,806 +1,575 @@
-# Adding System Updates and Maintenance Tools to My Bash Hardware Info App
+# System & Hardware Information IDE – Update Notes
 
-In my last Bash project, I built a System and Hardware Information tool with an IDE-style terminal interface.
+This update takes the Bash System & Hardware Information tool further and turns it into more of a small Linux maintenance console.
 
-It could show things like:
+The main changes are:
 
-- Operating system
-- CPU
-- Memory
-- Storage
-- Network
-- Graphics
-- Battery
-- USB devices
-- Temperatures
-
-At first, the tool was mostly for looking at information.
-
-This time, I wanted to make it actually do something too.
-
-So I added a new **Updates** section.
-
-Now the same Bash program can check for system updates, install Ubuntu updates, check firmware, look for recommended hardware drivers, and tell me when the computer needs to restart.
-
-The main thing I wanted was to keep everything inside the same terminal interface.
-
-I did not want the program to suddenly drop back to a normal shell every time `sudo`, `apt`, or `fwupdmgr` needed something.
-
-That turned out to be the interesting part.
+- Unicode box-drawing characters for a cleaner IDE look
+- Better box padding and alignment
+- Live update activity inside the same IDE
+- APT progress shown at the bottom of the update panel
+- Current package or update action displayed while the update runs
+- Built-in update and install logs
+- A Logs / Rollback section
+- Best-effort rollback for package and driver changes
+- Faster log browsing
+- More reliable refresh behavior
+- Fix for leftover log text after closing the log viewer
 
 ---
 
-## Adding an Updates Page
+## Unicode Boxes
 
-The first change was adding another item to the menu.
+The IDE now uses Unicode box-drawing characters when the terminal supports UTF-8.
 
-```bash
-MENU_ITEMS=(
-    "Overview"
-    "Operating System"
-    "Processor"
-    "Memory"
-    "Storage"
-    "Network"
-    "Graphics"
-    "Battery"
-    "Internal Hardware"
-    "USB Devices"
-    "Temperatures"
-    "Updates"
-)
-```
-
-When the user highlights **Updates**, the right side of the screen shows something like:
+Examples:
 
 ```text
-SYSTEM UPDATES
-------------------------------------------------------------
-
-Package Updates           12 available
-Security Updates          3 available
-Reboot Required           No
-
-FIRMWARE / BIOS
-------------------------------------------------------------
-
-Firmware Status           Up to date
-
-HARDWARE DRIVERS
-------------------------------------------------------------
-
-Driver Status             No additional drivers
-
-MAINTENANCE OPTIONS
-------------------------------------------------------------
-
-C   Check for updates
-U   Install Ubuntu updates
-F   Install firmware updates
-D   Install recommended drivers
+┌──────────────────────────┬──────────────────────────────────────────────┐
+│ SYSTEM INFO              │ Processor                                    │
+│                          │                                              │
+│ > Overview               │ PROCESSOR                                    │
+│   Operating System       │ ───────────────────────────────────────────  │
+│   Processor              │ Processor        Intel Core...               │
+│   Memory                 │ CPU Threads      16                          │
+└──────────────────────────┴──────────────────────────────────────────────┘
 ```
 
-The keyboard shortcuts also change when the Updates page is selected.
+The script can still fall back to normal ASCII characters if Unicode is not supported.
 
-```text
-[C] Check   [U] Ubuntu Update   [F] Firmware   [D] Drivers   [Q] Quit
-```
-
-That made the maintenance section feel like part of the same app instead of a separate script.
-
----
-
-## Checking for Ubuntu Updates
-
-For normal system updates, I use `apt`.
-
-To count available updates:
+One problem with Unicode borders is that they are multi-byte characters. A method like this:
 
 ```bash
-get_package_update_count() {
+printf "%${count}s" "" | tr " " "─"
+```
 
-    local count
+can break the line character.
 
-    count=$(
-        apt list --upgradable 2>/dev/null |
-            tail -n +2 |
-            grep -c .
-    )
+The updated code builds the line using Bash string replacement instead:
 
-    echo "${count:-0}"
+```bash
+repeat_char() {
+
+    local char="$1"
+    local count="$2"
+    local output=""
+
+    ((count < 0)) && count=0
+
+    printf -v output '%*s' "$count" ''
+
+    output="${output// /$char}"
+
+    printf "%s" "$output"
 }
 ```
 
-This runs:
-
-```bash
-apt list --upgradable
-```
-
-and counts how many packages are available.
-
-For security updates, I filter the list:
-
-```bash
-get_security_update_count() {
-
-    local count
-
-    count=$(
-        apt list --upgradable 2>/dev/null |
-            tail -n +2 |
-            grep -Ei -- '-security|security' |
-            wc -l
-    )
-
-    echo "${count:-0}"
-}
-```
-
-This gives me a quick idea of how many updates are regular software updates and how many are related to security.
+This keeps Unicode horizontal borders clean.
 
 ---
 
-## Checking if a Reboot Is Required
+## Better Box Padding
 
-Ubuntu creates this file when a restart is needed:
+The main IDE and popup windows now use the same geometry rules.
 
-```text
-/var/run/reboot-required
-```
+The left menu, right information panel, and modal windows all reserve padding between text and borders.
 
-So checking for a reboot is simple:
+For example, the right panel no longer writes directly beside the border.
+
+The script calculates the available area first:
 
 ```bash
-get_reboot_status() {
-
-    if [[ -f /var/run/reboot-required ]]; then
-        echo "Yes"
-    else
-        echo "No"
-    fi
-}
+RIGHT_WIDTH=$((COLS - MENU_DIVIDER_X - 2))
 ```
 
-This lets the Updates page show:
+Then content is drawn inside that area instead of using hard-coded positions.
 
-```text
-Reboot Required           Yes
-```
-
-instead of making the user guess.
+This fixed several off-by-one alignment problems.
 
 ---
 
-## Adding Firmware Update Checking
+## Live Update Progress
 
-I also wanted to check BIOS and device firmware.
+System updates now stay inside the IDE.
 
-For that, I added:
+The right panel becomes a live maintenance screen while updates are running.
 
-```bash
-fwupdmgr
-```
-
-which comes from:
-
-```text
-fwupd
-```
-
-The script checks for firmware updates with:
-
-```bash
-fwupdmgr get-updates
-```
-
-Then I look at the result and display something simple:
-
-```text
-Firmware Status           Updates available
-```
-
-or:
-
-```text
-Firmware Status           Up to date
-```
-
-I did not want to dump the entire `fwupdmgr` output into the normal screen because the goal of this project is still to keep things readable.
-
----
-
-## Checking Hardware Drivers
-
-For Ubuntu-supported drivers, I added:
-
-```bash
-ubuntu-drivers
-```
-
-The script can check for recommended hardware drivers with:
-
-```bash
-ubuntu-drivers list
-```
-
-If something is available, the program can show:
-
-```text
-Driver Status             Available: nvidia-driver-xxx
-```
-
-If nothing extra is needed:
-
-```text
-Driver Status             No additional drivers
-```
-
-This was especially useful because driver information can get messy if you just run everything manually.
-
----
-
-## Keeping Updates Inside the IDE
-
-This was probably the biggest improvement.
-
-At first, I had the update process leave the IDE and go back to a normal terminal.
-
-That worked, but it did not feel right.
-
-The program would look like a terminal app, then suddenly become normal command output.
-
-So I changed it.
-
-Now the update process stays inside the right panel.
-
-It looks something like:
+Example:
 
 ```text
 SYSTEM MAINTENANCE
-------------------------------------------------------------
+────────────────────────────────────────────────────────────
 
 Installing Ubuntu package updates...
 
-[##########################          ]
+Get:14 linux-firmware...
+Preparing package...
+Unpacking package...
+Configuring package...
 
-Installing available software and security updates.
+Action: Configuring package
+Item:   openssl
 
-Please do not close the program while this step is running.
+Progress [#########################               ] 63%
 ```
 
-The update command itself still runs normally.
+The progress bar stays near the bottom while the current action is shown above it.
 
-For example:
-
-```bash
-sudo apt-get upgrade -y
-```
-
-But the output is redirected to a temporary log file:
+Normal command output is redirected to a log so it does not destroy the terminal interface.
 
 ```bash
 "$@" </dev/null >"$logfile" 2>&1 &
 ```
 
-Then the program watches the background process.
-
-```bash
-while kill -0 "$pid" 2>/dev/null; do
-    draw_update_bar "$position" "$bar_width"
-done
-```
-
-That way `apt` does not destroy the interface.
+The script watches the background process and updates only the progress area.
 
 ---
 
-## Issue: Package Output Was Breaking the Screen
+## Sudo Password Dialog
 
-One of the problems I ran into was that command output could mess up the IDE borders.
+The script no longer drops out of the IDE when administrator access is required.
 
-Commands like:
-
-```bash
-apt-get
-```
-
-can print a lot of information.
-
-If that output appears directly in the terminal, it can overwrite the menu, status bar, or borders.
-
-The fix was redirecting the output:
-
-```bash
-> "$logfile" 2>&1
-```
-
-Now the command runs quietly in the background while the IDE shows its own progress display.
-
-If something fails, I can still read the end of the log.
-
-```bash
-tail -8 "$logfile"
-```
-
-So I get a clean interface without hiding the error completely.
-
----
-
-## Adding a Sudo Password Dialog
-
-The next problem was `sudo`.
-
-Normally, Linux would show something like:
+Instead, it displays a centered password dialog.
 
 ```text
-[sudo] password for user:
+┌──────────────────────────────────────────────────────────────┐
+│                  Administrator Password                      │
+│                                                              │
+│   Administrator access is required to continue.              │
+│                                                              │
+│   Password: ******************************                    │
+│                                                              │
+│            ENTER Continue     ESC Cancel                     │
+└──────────────────────────────────────────────────────────────┘
 ```
 
-That would appear outside the layout and ruin the interface.
+The password is masked on screen.
 
-So instead, I made my own password dialog.
-
-It looks like:
-
-```text
-+--------------------------------------------------------------+
-|                    Administrator Password                    |
-|                                                              |
-|       Administrator access is required to continue.          |
-|                                                              |
-|       Password: ************************                     |
-|                                                              |
-|            ENTER Continue     ESC Cancel                     |
-|                                                              |
-+--------------------------------------------------------------+
-```
-
-The password is masked with `*`.
-
-The input function reads one character at a time:
-
-```bash
-IFS= read -r -n1 char
-```
-
-Then it builds the password in memory.
-
-```bash
-DIALOG_PASSWORD+="$char"
-```
-
-But on the screen, I only show:
-
-```text
-********
-```
-
-instead of the real password.
-
----
-
-## Using the Password With Sudo
-
-Once the user enters the password, I send it to `sudo` through standard input.
+The script validates it with:
 
 ```bash
 printf '%s\n' "$DIALOG_PASSWORD" |
     sudo -S -p '' -v
 ```
 
-After that, I remove the variable:
+The password variable is removed after use:
 
 ```bash
 unset DIALOG_PASSWORD
 ```
 
-I also check first if sudo credentials are already cached:
-
-```bash
-sudo -n true
-```
-
-If that works, the password dialog does not appear again.
-
-That makes the tool a lot less annoying when several maintenance tasks are run one after another.
+If sudo credentials are already cached, the dialog is skipped.
 
 ---
 
-## Issue: Password Dialog Padding
+## Reboot Dialog
 
-Another thing that took some work was the box alignment.
-
-Bash terminal interfaces are very easy to make ugly.
-
-If the width calculation is off by even one character, you get something like:
+If an update requires a restart, the program now asks inside the IDE.
 
 ```text
-+----------------------+
-| Password: ******      |
-|                       |
-+-----------------------+
+┌──────────────────────────────────────────────────────────────┐
+│                     Reboot Required                          │
+│                                                              │
+│   The update completed successfully.                         │
+│   A restart is required to finish applying changes.          │
+│                                                              │
+│       [Y] Restart Now        [N] Restart Later               │
+└──────────────────────────────────────────────────────────────┘
 ```
 
-The right side stops lining up.
+Choosing restart later keeps the program open.
 
-The fix was to make every dialog use the same box-drawing function.
-
-```bash
-modal_draw() {
-
-    local title="$1"
-    local width="$2"
-    local height="$3"
-
-    MODAL_X=$(((COLS - width) / 2))
-    MODAL_Y=$(((LINES - height) / 2))
-
-    ...
-}
-```
-
-Then every message, password box, reboot dialog, and error dialog uses the same calculations.
-
-That helped fix the uneven padding.
-
----
-
-## Centering Dialog Text
-
-I also made a helper for centered text.
-
-```bash
-modal_center_text() {
-
-    local relative_row="$1"
-    local text="$2"
-
-    local x=$(
-        echo $((MODAL_X + (MODAL_W - ${#text}) / 2))
-    )
-
-    tput cup \
-        $((MODAL_Y + relative_row)) \
-        "$x"
-
-    printf "%s" "$text"
-}
-```
-
-That means I no longer have to guess how many spaces should go before a message.
-
-The program calculates it.
-
-This is a small thing, but it made the dialogs look much better.
-
----
-
-## Adding Confirmation Dialogs
-
-For updates, I did not want one keypress to immediately start changing the computer.
-
-So I added confirmation boxes.
-
-For example:
-
-```text
-+------------------------------------------------------------------+
-|                      Ubuntu System Update                        |
-|                                                                  |
-|       Install all currently available Ubuntu updates?            |
-|       A restart may be required after installation.              |
-|                                                                  |
-|          [Y] Install Updates     [N] Cancel                      |
-|                                                                  |
-+------------------------------------------------------------------+
-```
-
-The same function can be reused for:
-
-- Ubuntu updates
-- Driver installation
-- Firmware updates
-- Reboot confirmation
-
-That made the code easier to manage.
-
----
-
-## Installing Ubuntu Updates
-
-The Ubuntu update process now works like this:
-
-```text
-Press U
-   |
-   +-- Confirmation dialog
-          |
-          +-- Sudo password dialog
-                 |
-                 +-- apt update
-                 |
-                 +-- apt upgrade
-                 |
-                 +-- Reboot check
-```
-
-The update commands are still simple:
-
-```bash
-sudo apt-get update
-```
-
-and:
-
-```bash
-sudo apt-get upgrade -y
-```
-
-The difference is the user does not see raw command output.
-
-The IDE handles the display.
-
----
-
-## Adding Driver Installation
-
-For hardware drivers, pressing:
-
-```text
-D
-```
-
-first checks if Ubuntu recommends anything.
-
-If no driver is needed:
-
-```text
-No additional recommended drivers were detected.
-```
-
-If one is available, the program asks before installing.
-
-The command used is:
-
-```bash
-sudo ubuntu-drivers install
-```
-
-Again, the install stays inside the IDE with the same progress bar.
-
----
-
-## Firmware Needed More Care
-
-Firmware is a little different.
-
-Installing a normal software update is one thing.
-
-Updating BIOS or device firmware is more serious.
-
-So I made the firmware option require confirmation.
-
-The program also shows a warning:
-
-```text
-Keep the computer connected to power during the update.
-```
-
-Then it runs:
-
-```bash
-fwupdmgr update
-```
-
-with options that let my Bash interface handle the confirmation and restart message instead of letting `fwupdmgr` create its own prompts.
-
-The goal was to keep the workflow consistent.
-
----
-
-## Adding a Reboot Dialog
-
-After an update, the script checks if the system needs to restart.
-
-If it does, a popup appears:
-
-```text
-+--------------------------------------------------------------+
-|                     Reboot Required                          |
-|                                                              |
-|       The update completed successfully.                     |
-|       A restart is required to finish applying changes.      |
-|                                                              |
-|          [Y] Restart Now     [N] Restart Later               |
-|                                                              |
-+--------------------------------------------------------------+
-```
-
-If the user chooses restart later, the app stays open.
-
-The status bar changes to:
-
-```text
-STATUS: Reboot required - restart later
-```
-
-If the user chooses restart now, the program runs:
+Choosing restart now runs:
 
 ```bash
 sudo systemctl reboot
 ```
 
-I like this much better than automatically restarting the computer.
-
 ---
 
-## Issue: Firmware Reboots
+## Update and Install Logs
 
-Normal Ubuntu package updates can create:
+Every update or installation can now create a dated log.
+
+Logs are stored in:
 
 ```text
-/var/run/reboot-required
+~/.local/state/sysinfo-ide/logs
 ```
 
-But firmware updates may not always behave exactly the same way.
+A typical log can contain:
 
-So I added another flag:
-
-```bash
-FORCE_REBOOT_REQUIRED=1
+```text
+System & Hardware Information / Maintenance IDE
+Operation : system-update
+Started   : 2026-09-09 22:15:41 PDT
+Computer  : workstation
+User      : teo
+----------------------------------------------------------------
+[2026-09-09 22:15:41] Captured pre-update package snapshot.
+[2026-09-09 22:15:42] APT command: apt-get update
+[2026-09-09 22:15:43] Hit:1 ...
+[2026-09-09 22:15:44] Get:2 ...
+[2026-09-09 22:15:48] APT command completed successfully.
+[2026-09-09 22:15:48] APT command: apt-get upgrade -y
+[2026-09-09 22:15:49] Downloading openssl
+[2026-09-09 22:15:52] Unpacking openssl
+[2026-09-09 22:15:54] Setting up openssl
+----------------------------------------------------------------
+Finished  : 2026-09-09 22:16:19 PDT
+Status    : success
 ```
 
-After a firmware update succeeds, the program treats the machine as needing a restart.
-
-Then the same reboot dialog appears.
-
-This keeps the behavior simple for the user.
+This makes it easier to see what actually happened during an update.
 
 ---
 
-## Fixing the Main Box Padding
+## Logs / Rollback Page
 
-I also went back and cleaned up the main IDE layout.
+A new menu item was added:
 
-The left menu, divider, and right panel all use fixed geometry.
+```text
+Logs / Rollback
+```
+
+The main shortcuts include:
+
+```text
+L   View logs
+B   Rollback
+```
+
+The log browser lets the user choose a log and open it inside the IDE.
+
+The viewer supports scrolling with the arrow keys.
+
+---
+
+## Faster Log Viewer
+
+The first log viewer was laggy.
+
+The problem was that every Up or Down keypress could redraw the whole IDE.
+
+If the user entered the log viewer from the Updates page, a full redraw could also run slower checks like:
+
+```bash
+fwupdmgr
+ubuntu-drivers
+```
+
+That meant simply scrolling through a text file could trigger hardware checks.
+
+The fix was to cache the log list and redraw only the rows that changed.
+
+Instead of:
+
+```bash
+while true; do
+    draw_ui
+    draw_log
+    read_key
+done
+```
+
+the viewer now works more like:
+
+```bash
+draw_ui_cached
+render_log_window "$offset" "$visible"
+
+while true; do
+
+    read_key
+
+    case "$KEY" in
+
+        $'\e[A'|$'\eOA')
+            ((offset--))
+            render_log_window "$offset" "$visible"
+            ;;
+
+        $'\e[B'|$'\eOB')
+            ((offset++))
+            render_log_window "$offset" "$visible"
+            ;;
+
+    esac
+
+done
+```
+
+Only the visible log rows are updated.
+
+This makes scrolling much faster.
+
+---
+
+## Rollback Transactions
+
+Transaction data is stored separately in:
+
+```text
+~/.local/state/sysinfo-ide/transactions
+```
+
+Before a package update, the script can save a package-version snapshot.
+
+After the update, it compares the before and after states.
+
+A transaction may look like:
+
+```text
+CHANGED    openssl          3.0.13-0ubuntu3.5    3.0.13-0ubuntu3.6
+CHANGED    libssl3          3.0.13-0ubuntu3.5    3.0.13-0ubuntu3.6
+INSTALLED  linux-image-...  -                    6.x.x-...
+```
+
+For changed packages, the rollback function can try to reinstall the earlier version:
+
+```text
+openssl=3.0.13-0ubuntu3.5
+libssl3=3.0.13-0ubuntu3.5
+```
+
+Rollback is best effort.
+
+It only works when the older package versions are still available through APT.
+
+---
+
+## Rollback Safety Check
+
+Before changing anything, the rollback function performs an APT simulation.
+
+The idea is simple:
+
+```text
+Rollback selected
+       |
+       +-- Build old package version list
+       |
+       +-- Run APT simulation
+       |
+       +-- Simulation succeeds?
+              |
+              +-- Yes -> ask for confirmation
+              |
+              +-- No  -> stop
+```
+
+If APT cannot build a valid dependency plan, the rollback stops before changing the system.
+
+This makes rollback safer than blindly forcing old packages back onto the machine.
+
+---
+
+## Firmware Rollback
+
+Firmware activity is logged, but automatic firmware rollback is intentionally not included.
+
+Firmware can include:
+
+- BIOS / UEFI
+- SSD firmware
+- docks
+- USB devices
+- other hardware
+
+A bad firmware downgrade can cause much bigger problems than a normal package downgrade.
+
+Because of that, the script records the firmware activity but does not automatically downgrade firmware.
+
+---
+
+## Refresh Fix
+
+Refresh was also improved.
+
+The earlier version cleared the right panel first and then collected new information.
+
+That could leave the screen blank while slower commands were running.
+
+The new order is:
+
+```text
+Collect new information
+        |
+        v
+Store completed output
+        |
+        v
+Clear old panel
+        |
+        v
+Draw new information
+```
+
+The important part looks like:
+
+```bash
+mapfile -t new_info_lines < <(
+    get_information 2>&1
+)
+
+INFO_LINES=("${new_info_lines[@]}")
+
+clear_right_panel
+```
+
+The old screen stays visible until the new information is ready.
+
+---
+
+## Refresh Lock
+
+The script also uses a refresh lock.
+
+This prevents a terminal resize event from interrupting a refresh and causing two redraws at the same time.
+
+If a resize happens while a refresh is running, the resize is delayed until the refresh is finished.
+
+This helps prevent partial borders and mixed screen contents.
+
+---
+
+## Timeout for Slow Hardware Checks
+
+The Updates page uses commands such as:
+
+```bash
+fwupdmgr
+ubuntu-drivers
+```
+
+These can sometimes take a while.
+
+The updated version limits the slow status checks so one stuck command cannot make the whole refresh appear frozen.
+
+This makes the Updates page much more predictable.
+
+---
+
+## Fixing Leftover Log Text
+
+Another bug appeared after closing the log viewer.
+
+Some log lines stayed behind inside the left menu panel.
 
 For example:
 
-```bash
-MENU_DIVIDER_X=27
+```text
+[2026-09-09 22:24:31]
+[2026-09-09 22:24:32]
+Finished :
+Status   :
 ```
 
-The script then calculates:
+The cause was that `draw_menu()` redrew only the rows containing menu choices.
+
+The lower part of the left panel was never erased.
+
+The fix was to add a full left-panel clear:
 
 ```bash
-MENU_INNER_WIDTH=$((MENU_DIVIDER_X - 1))
+clear_left_panel() {
+
+    local row
+
+    for ((row=2; row<=CONTENT_BOTTOM; row++)); do
+
+        tput cup "$row" 1
+
+        printf "%${MENU_INNER_WIDTH}s" ""
+
+    done
+}
 ```
 
-and:
+Then the menu redraw starts by clearing the entire inside of the left panel:
 
 ```bash
-RIGHT_WIDTH=$((COLS - MENU_DIVIDER_X - 2))
+draw_menu() {
+
+    clear_left_panel
+
+    # Draw menu again...
+
+}
 ```
 
-That means the program does not just guess the size of the borders.
-
-The left panel knows exactly where it ends.
-
-The right panel knows exactly how much space it has.
-
-The result is cleaner alignment when the terminal changes size.
+Now closing the log viewer, rollback browser, or another large popup restores the complete IDE background.
 
 ---
 
-## Why I Kept ASCII Borders
+## What the Tool Can Do Now
 
-I stayed with regular characters:
+The Bash System & Hardware Information IDE can now:
 
-```text
-+
--
-|
-```
-
-instead of Unicode box characters.
-
-It is not as fancy, but it works well across different terminals.
-
-For a Bash project like this, I would rather have:
-
-```text
-+------------------------+
-|       SYSTEM INFO      |
-+------------------------+
-```
-
-work everywhere than spend time fixing terminal font problems.
-
----
-
-## What This Project Became
-
-Originally, this was just a system information viewer.
-
-Now it is closer to a small maintenance console.
-
-It can:
-
-- View system information
-- View hardware information
+- View operating system information
+- View CPU information
+- View memory usage
+- View storage information
+- View network information
+- View graphics hardware
+- View battery information
+- View internal PCI hardware
+- View USB devices
+- View system temperatures
 - Check Ubuntu updates
-- Count security updates
+- Check security updates
 - Check firmware
-- Check recommended drivers
-- Install software updates
-- Install supported drivers
-- Install firmware updates
-- Ask for sudo passwords inside the UI
-- Show installation progress
-- Detect reboot requirements
-- Ask before restarting
-
-That is a lot more than where the project started.
+- Check hardware drivers
+- Install Ubuntu updates
+- Install recommended drivers
+- Install supported firmware
+- Show live update progress
+- Display what is currently downloading or installing
+- Ask for sudo passwords inside the IDE
+- Ask before rebooting
+- Save update and install logs
+- Browse logs inside the IDE
+- Save package transaction information
+- Attempt package and driver rollback
+- Simulate rollback before changing anything
+- Handle terminal resizing
+- Refresh pages without blanking the screen
+- Use Unicode box-drawing characters
 
 ---
 
-## What I Learned This Time
+## Final Thoughts
 
-The update features taught me a few new things.
+This project started as a system information viewer.
 
-I worked with:
+Then I added an IDE-style interface.
 
-- `apt`
-- `sudo`
-- `fwupdmgr`
-- `ubuntu-drivers`
-- background processes
-- exit codes
-- temporary log files
-- masked keyboard input
-- reusable confirmation dialogs
-- reboot detection
-- terminal layout calculations
-- modal windows in Bash
-- keeping command output inside a TUI
+Then updates.
 
-The biggest lesson was that the actual Linux commands are usually the easy part.
+Then password dialogs.
 
-Running:
+Then firmware and driver support.
 
-```bash
-sudo apt-get upgrade -y
-```
+Then logs.
 
-is simple.
+Then rollback.
 
-Making it fit inside a terminal interface, asking for the password cleanly, handling failures, keeping the borders aligned, and asking about the reboot is where most of the work happens.
+Then I had to fix the log viewer because scrolling through a text file somehow became a hardware-checking operation.
 
-That is also the part I enjoy.
+Then I had to fix the fix because old log text stayed behind on the screen.
 
-Take a normal Linux command.
+That is probably the most Bash part of this whole project.
 
-Wrap it in Bash.
+The Linux commands themselves are usually simple.
 
-Add an interface.
+The interesting part is getting all of those commands to behave like one clean terminal application.
 
-Break the interface.
+At this point, the project is much closer to a small Linux System Information and Maintenance IDE than the simple system-info script it started as.
 
-Fix the interface.
-
-Then add one more feature and break it again.
-
-That seems to be the process.
-
-For now, my Bash System Information tool has officially turned into a System Information and Maintenance IDE.
-
-And yes, I could just use the normal Ubuntu updater.
-
-But again, where is the fun in that?
+And there will probably be another feature after this one.
 
 ---
 
 ## Keywords
 
-Bash, Linux, Shell Scripting, Bash Scripting, Ubuntu, Debian, System Administration, Linux Administration, Terminal UI, TUI, System Maintenance, System Updates, Ubuntu Updates, Security Updates, Firmware Updates, BIOS Updates, fwupd, fwupdmgr, Hardware Drivers, ubuntu-drivers, sudo, apt, apt-get, Reboot Detection, Reboot Required, Password Dialog, Modal Dialog, ASCII Interface, Terminal Interface, Progress Bar, Dependency Checking, Hardware Information, System Information, CPU Information, Memory Usage, Storage Information, Network Information, USB Devices, Battery Information, Linux Automation, Command Line, CLI, IT Administration, Linux Projects, Bash Projects, Troubleshooting, Terminal Programming, Learning Bash, System Tools, Software Updates, Driver Updates, Firmware Management
+Bash, Linux, Shell Scripting, Bash Scripting, Ubuntu, Debian, Terminal UI, TUI, Unicode Terminal, Unicode Box Drawing, System Information, Hardware Information, System Maintenance, Ubuntu Updates, Linux Updates, Security Updates, Firmware Updates, BIOS Updates, fwupd, fwupdmgr, Hardware Drivers, ubuntu-drivers, apt, apt-get, sudo, Linux Logs, Update Logs, Install Logs, Rollback, Package Rollback, Driver Rollback, APT Simulation, Linux Administration, System Administration, Progress Bar, Live Progress, Terminal Programming, Modal Dialog, Password Dialog, Reboot Dialog, Dependency Checking, Troubleshooting, Linux Automation, IT Administration, CLI, Command Line, Bash Projects
