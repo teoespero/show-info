@@ -89,12 +89,12 @@ LOG_RETENTION_DAYS=90
 UPDATE_CHECK_TIMEOUT=8
 DRIVER_CHECK_TIMEOUT=8
 FIRMWARE_CHECK_TIMEOUT=8
-CACHE_FAST_TTL=2
-CACHE_NETWORK_TTL=5
-CACHE_STORAGE_TTL=10
-CACHE_HEALTH_TTL=5
-CACHE_EVENTS_TTL=10
-CACHE_HARDWARE_TTL=300
+CACHE_FAST_TTL=20
+CACHE_NETWORK_TTL=60
+CACHE_STORAGE_TTL=120
+CACHE_HEALTH_TTL=60
+CACHE_EVENTS_TTL=120
+CACHE_HARDWARE_TTL=600
 TEMPERATURE_WARNING=80
 TEMPERATURE_CRITICAL=90
 MEMORY_WARNING=80
@@ -115,12 +115,12 @@ LOG_RETENTION_DAYS=90
 UPDATE_CHECK_TIMEOUT=8
 DRIVER_CHECK_TIMEOUT=8
 FIRMWARE_CHECK_TIMEOUT=8
-CACHE_FAST_TTL=2
-CACHE_NETWORK_TTL=5
-CACHE_STORAGE_TTL=10
-CACHE_HEALTH_TTL=5
-CACHE_EVENTS_TTL=10
-CACHE_HARDWARE_TTL=300
+CACHE_FAST_TTL=20
+CACHE_NETWORK_TTL=60
+CACHE_STORAGE_TTL=120
+CACHE_HEALTH_TTL=60
+CACHE_EVENTS_TTL=120
+CACHE_HARDWARE_TTL=600
 TEMPERATURE_WARNING=80
 TEMPERATURE_CRITICAL=90
 MEMORY_WARNING=80
@@ -154,6 +154,24 @@ load_config() {
 }
 
 load_config
+
+# Keep navigation snappy even if an older config file still has very short TTLs.
+ensure_min_ttl() {
+    local name="$1"
+    local min="$2"
+    local value="${!name}"
+
+    if ! [[ "$value" =~ ^[0-9]+$ ]] || ((value < min)); then
+        printf -v "$name" '%s' "$min"
+    fi
+}
+
+ensure_min_ttl CACHE_FAST_TTL 20
+ensure_min_ttl CACHE_NETWORK_TTL 60
+ensure_min_ttl CACHE_STORAGE_TTL 120
+ensure_min_ttl CACHE_HEALTH_TTL 60
+ensure_min_ttl CACHE_EVENTS_TTL 120
+ensure_min_ttl CACHE_HARDWARE_TTL 600
 
 # ------------------------------------------------------------
 # PRE-IDE DEPENDENCY INSTALL ACTIVITY BAR
@@ -395,6 +413,12 @@ STATUS_MESSAGE="Ready"
 FORCE_REBOOT_REQUIRED=0
 LAST_UPDATE_ERROR=""
 
+# Cached maintenance counters. Normal page navigation reads these values
+# instead of running slow apt scans every time the Updates or Health page opens.
+LAST_PACKAGE_UPDATE_COUNT="Not checked"
+LAST_SECURITY_UPDATE_COUNT="Not checked"
+LAST_UPDATE_CHECK_TIME="Never"
+
 # Refresh/redraw state. These keep a resize signal from drawing
 # over a page while fresh information is still being collected.
 UI_BUSY=0
@@ -481,6 +505,16 @@ repeat_char() {
     printf "%s" "$output"
 }
 
+# Reduce visible flicker on terminals that support synchronized output.
+# Unsupported terminals safely ignore these escape sequences.
+begin_screen_update() {
+    printf '\033[?2026h' 2>/dev/null || true
+}
+
+end_screen_update() {
+    printf '\033[?2026l' 2>/dev/null || true
+}
+
 trim_text() {
     local text="$1"
     local max="$2"
@@ -557,15 +591,22 @@ make_usage_bar() {
 # ------------------------------------------------------------
 get_overview() {
     local manufacturer model cpu memory ip_address disk_percent mem_percent
+    local free_h free_raw df_root
 
     manufacturer=$(read_file /sys/class/dmi/id/sys_vendor)
     model=$(read_file /sys/class/dmi/id/product_name)
     cpu=$(get_cpu_model)
-    memory=$(free -h | awk '/Mem:/ {print $2}')
+
+    # Call free and df once each. Calling the same probe repeatedly makes
+    # the interface feel slower when moving through pages.
+    free_h=$(free -h 2>/dev/null)
+    free_raw=$(free 2>/dev/null)
+    df_root=$(df -h / 2>/dev/null | awk 'NR==2 {print $0}')
+
+    memory=$(awk '/Mem:/ {print $2}' <<< "$free_h")
+    mem_percent=$(awk '/Mem:/ {printf "%.0f", ($3 / $2) * 100}' <<< "$free_raw")
+    disk_percent=$(awk '{gsub(/%/, "", $5); print $5}' <<< "$df_root")
     ip_address=$(hostname -I 2>/dev/null | awk '{print $1}')
-    mem_percent=$(get_memory_percent)
-    disk_percent=$(get_root_usage)
-    disk_percent="${disk_percent//%/}"
 
     echo "COMPUTER"
     echo "------------------------------------------------------------"
@@ -592,10 +633,10 @@ get_overview() {
     echo "CURRENT USAGE"
     echo "------------------------------------------------------------"
     printf "%-21s " "Memory"
-    make_usage_bar "$mem_percent"
+    make_usage_bar "${mem_percent:-0}"
     echo
     printf "%-21s " "System Drive"
-    make_usage_bar "$disk_percent"
+    make_usage_bar "${disk_percent:-0}"
     echo
 
     echo
@@ -603,7 +644,6 @@ get_overview() {
     echo "------------------------------------------------------------"
     printf "%-21s %s\n" "Primary IP Address" "${ip_address:-Not connected}"
 }
-
 get_os() {
     echo "OPERATING SYSTEM"
     echo "------------------------------------------------------------"
@@ -629,11 +669,14 @@ get_os() {
 }
 
 get_processor() {
-    local model sockets cores threads physical_cores cpu_mhz
+    local lscpu_out model sockets cores threads physical_cores cpu_mhz
 
-    model=$(get_cpu_model)
-    sockets=$(get_cpu_sockets)
-    cores=$(get_cpu_cores)
+    # lscpu is useful, but calling it several times per page adds delay.
+    # Capture it once, then parse the saved output.
+    lscpu_out=$(lscpu 2>/dev/null)
+    model=$(awk -F: '/Model name/ {gsub(/^[ \t]+/, "", $2); print $2; exit}' <<< "$lscpu_out")
+    sockets=$(awk -F: '/Socket\(s\):/ {gsub(/[ \t]/, "", $2); print $2; exit}' <<< "$lscpu_out")
+    cores=$(awk -F: '/^Core\(s\) per socket:/ {gsub(/[ \t]/, "", $2); print $2; exit}' <<< "$lscpu_out")
     threads=$(nproc)
 
     if [[ "$sockets" =~ ^[0-9]+$ ]] && [[ "$cores" =~ ^[0-9]+$ ]]; then
@@ -649,7 +692,7 @@ get_processor() {
     printf "%-22s %s\n" "CPU Threads" "$threads"
     printf "%-22s %s\n" "System Type" "$(human_architecture)"
 
-    cpu_mhz=$(lscpu 2>/dev/null | awk -F: '/CPU max MHz/ {gsub(/^[ \t]+/, "", $2); if ($2 > 0) printf "%.2f GHz", $2 / 1000; exit}')
+    cpu_mhz=$(awk -F: '/CPU max MHz/ {gsub(/^[ \t]+/, "", $2); if ($2 > 0) printf "%.2f GHz", $2 / 1000; exit}' <<< "$lscpu_out")
     [[ -n "$cpu_mhz" ]] && printf "%-22s %s\n" "Maximum Speed" "$cpu_mhz"
 
     echo
@@ -664,16 +707,21 @@ get_processor() {
     echo
     echo "Lower load usually means the processor is less busy."
 }
-
 get_memory() {
     local total used available swap_total swap_used percent
+    local free_h free_raw
 
-    total=$(free -h | awk '/Mem:/ {print $2}')
-    used=$(free -h | awk '/Mem:/ {print $3}')
-    available=$(free -h | awk '/Mem:/ {print $7}')
-    swap_total=$(free -h | awk '/Swap:/ {print $2}')
-    swap_used=$(free -h | awk '/Swap:/ {print $3}')
-    percent=$(get_memory_percent)
+    # Pull memory data once in human-readable form and once in raw numbers
+    # for the percentage calculation.
+    free_h=$(free -h 2>/dev/null)
+    free_raw=$(free 2>/dev/null)
+
+    total=$(awk '/Mem:/ {print $2}' <<< "$free_h")
+    used=$(awk '/Mem:/ {print $3}' <<< "$free_h")
+    available=$(awk '/Mem:/ {print $7}' <<< "$free_h")
+    swap_total=$(awk '/Swap:/ {print $2}' <<< "$free_h")
+    swap_used=$(awk '/Swap:/ {print $3}' <<< "$free_h")
+    percent=$(awk '/Mem:/ {printf "%.0f", ($3 / $2) * 100}' <<< "$free_raw")
 
     echo "MEMORY"
     echo "------------------------------------------------------------"
@@ -682,7 +730,7 @@ get_memory() {
     printf "%-22s %s\n" "Available Memory" "$available"
     echo
     printf "%-22s " "Memory Usage"
-    make_usage_bar "$percent"
+    make_usage_bar "${percent:-0}"
     echo
 
     echo
@@ -702,20 +750,22 @@ get_memory() {
         echo "Memory usage is high."
     fi
 }
-
 get_storage() {
-    local disk_percent
-    disk_percent=$(get_root_usage)
-    disk_percent="${disk_percent//%/}"
+    local root_total root_used root_free disk_percent df_root
+    df_root=$(df -h / 2>/dev/null | awk 'NR==2 {print $0}')
+    root_total=$(awk '{print $2}' <<< "$df_root")
+    root_used=$(awk '{print $3}' <<< "$df_root")
+    root_free=$(awk '{print $4}' <<< "$df_root")
+    disk_percent=$(awk '{gsub(/%/, "", $5); print $5}' <<< "$df_root")
 
     echo "SYSTEM DRIVE"
     echo "------------------------------------------------------------"
-    printf "%-22s %s\n" "Total Capacity" "$(get_root_total)"
-    printf "%-22s %s\n" "Used Space" "$(get_root_used)"
-    printf "%-22s %s\n" "Available Space" "$(get_root_free)"
+    printf "%-22s %s\n" "Total Capacity" "$root_total"
+    printf "%-22s %s\n" "Used Space" "$root_used"
+    printf "%-22s %s\n" "Available Space" "$root_free"
     echo
     printf "%-22s " "Storage Usage"
-    make_usage_bar "$disk_percent"
+    make_usage_bar "${disk_percent:-0}"
     echo
 
     echo
@@ -734,7 +784,6 @@ get_storage() {
     df -h -x tmpfs -x devtmpfs -x squashfs 2>/dev/null |
         awk 'NR > 1 {printf "%-22s %-10s %-8s\n", $6, $2, $5}'
 }
-
 get_network() {
     local default_interface gateway connection_state
 
@@ -1332,40 +1381,53 @@ get_driver_status() {
 }
 
 get_updates() {
-    local package_count security_count firmware_status driver_status reboot_status
-    package_count=$(get_package_update_count)
-    security_count=$(get_security_update_count)
-    firmware_status=$(get_firmware_status)
-    driver_status=$(get_driver_status)
+    local package_count security_count reboot_status latest_log latest_name checked_time
+
+    # Fast page load: do not run apt list here. Press C to do the real check.
+    package_count="$LAST_PACKAGE_UPDATE_COUNT"
+    security_count="$LAST_SECURITY_UPDATE_COUNT"
+    checked_time="$LAST_UPDATE_CHECK_TIME"
     reboot_status=$(get_reboot_status)
+    latest_log=$(latest_log_file)
+
+    if [[ -n "$latest_log" ]]; then
+        latest_name=$(basename "$latest_log")
+    else
+        latest_name="No update checks logged yet"
+    fi
 
     echo "SYSTEM UPDATES"
     echo "------------------------------------------------------------"
-    printf "%-25s %s\n" "Package Updates" "$package_count available"
-    printf "%-25s %s\n" "Security Updates" "$security_count available"
+    printf "%-25s %s\n" "Package Updates" "$package_count"
+    printf "%-25s %s\n" "Security Updates" "$security_count"
+    printf "%-25s %s\n" "Last Check" "$checked_time"
     printf "%-25s %s\n" "Reboot Required" "$reboot_status"
 
     echo
     echo "FIRMWARE / BIOS"
     echo "------------------------------------------------------------"
-    printf "%-25s %s\n" "Firmware Status" "$firmware_status"
+    printf "%-25s %s\n" "Firmware Status" "Use F to check/install firmware"
 
     echo
     echo "HARDWARE DRIVERS"
     echo "------------------------------------------------------------"
-    printf "%-25s %s\n" "Driver Status" "$driver_status"
+    printf "%-25s %s\n" "Driver Status" "Use D to check/install drivers"
+
+    echo
+    echo "LAST MAINTENANCE LOG"
+    echo "------------------------------------------------------------"
+    printf "%-25s %s\n" "Latest Log" "$latest_name"
 
     echo
     echo "MAINTENANCE OPTIONS"
     echo "------------------------------------------------------------"
-    echo "C   Check for updates"
+    echo "C   Check Ubuntu package repositories"
     echo "U   Install Ubuntu updates"
     echo "F   Install firmware updates"
     echo "D   Install recommended drivers"
     echo "L   Open update/install logs"
     echo "B   Open rollback transactions"
 }
-
 # ------------------------------------------------------------
 # SYSTEM HEALTH / EVENTS
 # ------------------------------------------------------------
@@ -1435,15 +1497,20 @@ health_state_for_percent() {
 get_system_health() {
     local mem disk temp failed updates reboot smart
     local mem_state disk_state temp_state service_state overall="Healthy"
+    local free_raw df_root
 
-    mem=$(get_memory_percent)
-    disk=$(get_root_usage)
-    disk="${disk//%/}"
+    free_raw=$(free 2>/dev/null)
+    mem=$(awk '/Mem:/ {printf "%.0f", ($3 / $2) * 100}' <<< "$free_raw")
+    df_root=$(df -h / 2>/dev/null | awk 'NR==2 {print $0}')
+    disk=$(awk '{gsub(/%/, "", $5); print $5}' <<< "$df_root")
     temp=$(get_cpu_temperature_value 2>/dev/null || true)
     failed=$(get_failed_service_count)
-    updates=$(get_package_update_count)
+    updates="$LAST_PACKAGE_UPDATE_COUNT"
     reboot=$(get_reboot_status)
-    smart=$(get_smart_summary)
+
+    # SMART and apt checks are intentionally skipped during normal page load
+    # because they can pause the interface on some systems.
+    smart="Skipped for fast navigation"
 
     [[ "$mem" =~ ^[0-9]+$ ]] || mem=0
     [[ "$disk" =~ ^[0-9]+$ ]] || disk=0
@@ -1463,7 +1530,7 @@ get_system_health() {
         service_state="OK"
     fi
 
-    if [[ "$mem_state" == "CRITICAL" || "$disk_state" == "CRITICAL" || "$temp_state" == "CRITICAL" || "$smart" == *"reporting failure"* ]]; then
+    if [[ "$mem_state" == "CRITICAL" || "$disk_state" == "CRITICAL" || "$temp_state" == "CRITICAL" ]]; then
         overall="Attention Required"
     elif [[ "$mem_state" == "WARN" || "$disk_state" == "WARN" || "$temp_state" == "WARN" || "$service_state" == "WARN" || "$reboot" == "Yes" ]]; then
         overall="Review Recommended"
@@ -1501,14 +1568,13 @@ get_system_health() {
     printf "%-25s Warn %s C / Critical %s C\n" "Temperature" "$TEMPERATURE_WARNING" "$TEMPERATURE_CRITICAL"
     printf "%-25s %s\n" "Config File" "$CONFIG_FILE"
 }
-
 get_events_problems() {
     local failed errors warnings
 
     echo "FAILED SERVICES"
     echo "------------------------------------------------------------"
 
-    failed=$(timeout 5s systemctl --failed --no-legend --plain 2>/dev/null | head -8)
+    failed=$(timeout 2s systemctl --failed --no-legend --plain 2>/dev/null | head -8)
     if [[ -n "$failed" ]]; then
         echo "$failed"
     else
@@ -1519,7 +1585,7 @@ get_events_problems() {
     echo "RECENT BOOT ERRORS"
     echo "------------------------------------------------------------"
 
-    errors=$(timeout 5s journalctl -b -p err..alert --no-pager -n 8 --output=short 2>/dev/null)
+    errors=$(timeout 2s journalctl -b -p err..alert --no-pager -n 8 --output=short 2>/dev/null)
     if [[ -n "$errors" && "$errors" != "-- No entries --" ]]; then
         echo "$errors"
     else
@@ -1530,7 +1596,7 @@ get_events_problems() {
     echo "RECENT KERNEL WARNINGS"
     echo "------------------------------------------------------------"
 
-    warnings=$(timeout 5s journalctl -k -b -p warning..alert --no-pager -n 8 --output=short 2>/dev/null)
+    warnings=$(timeout 2s journalctl -k -b -p warning..alert --no-pager -n 8 --output=short 2>/dev/null)
     if [[ -n "$warnings" && "$warnings" != "-- No entries --" ]]; then
         echo "$warnings"
     else
@@ -1599,7 +1665,7 @@ collect_page_text() {
     local ttl now then age text
 
     ttl=$(page_cache_ttl "$page")
-    now=$(date +%s)
+    now=$SECONDS
     then="${PAGE_CACHE_TIME[$page]:-0}"
     age=$((now - then))
 
@@ -1615,6 +1681,30 @@ collect_page_text() {
     PAGE_CACHE_TIME[$page]="$now"
 
     printf '%s\n' "$text"
+}
+
+
+collect_page_text_var() {
+    local page="$1"
+    local force="${2:-0}"
+    local ttl now then age text
+
+    ttl=$(page_cache_ttl "$page")
+    now=$SECONDS
+    then="${PAGE_CACHE_TIME[$page]:-0}"
+    age=$((now - then))
+
+    if ((force == 0)) && [[ -n "${PAGE_CACHE_TEXT[$page]+_}" ]]; then
+        if ((ttl < 0 || age < ttl)); then
+            COLLECTED_PAGE_TEXT="${PAGE_CACHE_TEXT[$page]}"
+            return 0
+        fi
+    fi
+
+    text=$(get_information_for_page "$page" 2>&1)
+    PAGE_CACHE_TEXT[$page]="$text"
+    PAGE_CACHE_TIME[$page]="$now"
+    COLLECTED_PAGE_TEXT="$text"
 }
 
 get_information() {
@@ -1809,6 +1899,7 @@ render_information_snapshot() {
 
     clamp_information_offset
 
+    begin_screen_update
     clear_right_panel
 
     tput cup 2 "$start_x"
@@ -1852,24 +1943,16 @@ render_information_snapshot() {
         tput cup "$CONTENT_BOTTOM" $((start_x + content_width - ${#indicator}))
         printf "%s" "$indicator"
     fi
+
+    end_screen_update
 }
 
 draw_information() {
-    local -a new_info_lines=()
-    local tmp
-
-    # Run get_information in the current shell so page-cache assignments
-    # survive the refresh. Process substitution would run it in a subshell
-    # and make the in-memory cache disappear after every draw.
-    tmp=$(mktemp)
-    get_information >"$tmp" 2>&1
-    mapfile -t new_info_lines < "$tmp"
-    rm -f "$tmp"
-
-    INFO_LINES=("${new_info_lines[@]}")
+    COLLECTED_PAGE_TEXT=""
+    collect_page_text_var "${MENU_ITEMS[$SELECTED]}" 0
+    mapfile -t INFO_LINES <<< "$COLLECTED_PAGE_TEXT"
     render_information_snapshot
 }
-
 scroll_information() {
     local action="$1"
     local visible total max_offset step
@@ -1949,20 +2032,42 @@ draw_information_cached() {
     render_information_snapshot
 }
 
+show_selected_page_auto() {
+    local page="${MENU_ITEMS[$SELECTED]}"
+
+    INFO_OFFSET=0
+
+    # Auto-load the selected page so the user does not have to press ENTER.
+    # The page cache and lighter maintenance checks keep navigation responsive.
+    STATUS_MESSAGE="Viewing ${page}..."
+    draw_menu
+    draw_status
+    draw_shortcuts
+    draw_information
+
+    STATUS_MESSAGE="Viewing ${page}"
+    draw_status
+    draw_shortcuts
+}
+
 draw_ui_cached() {
+    begin_screen_update
     draw_frame
     draw_menu
     draw_information_cached
     draw_status
     draw_shortcuts
+    end_screen_update
 }
 
 draw_ui() {
+    begin_screen_update
     draw_frame
     draw_menu
     draw_information
     draw_status
     draw_shortcuts
+    end_screen_update
 }
 
 # ------------------------------------------------------------
@@ -2076,7 +2181,7 @@ message_dialog() {
     local line1="$2"
     local line2="${3:-}"
 
-    draw_ui
+    draw_ui_cached
     modal_draw "$title" 64 10
     modal_center_text 3 "$line1"
     [[ -n "$line2" ]] && modal_center_text 4 "$line2"
@@ -2089,7 +2194,7 @@ message_dialog() {
         esac
     done
 
-    draw_ui
+    draw_ui_cached
 }
 
 confirm_dialog() {
@@ -2099,7 +2204,7 @@ confirm_dialog() {
     local yes_text="$4"
     local no_text="$5"
 
-    draw_ui
+    draw_ui_cached
     modal_draw "$title" 68 11
     modal_center_text 3 "$line1"
     modal_center_text 4 "$line2"
@@ -2112,11 +2217,11 @@ confirm_dialog() {
         read_key
         case "$KEY" in
             y|Y)
-                draw_ui
+                draw_ui_cached
                 return 0
                 ;;
             n|N|$'\e')
-                draw_ui
+                draw_ui_cached
                 return 1
                 ;;
         esac
@@ -2170,7 +2275,7 @@ request_sudo_dialog() {
     local sudo_password=""
 
     while ((attempts < 3)); do
-        draw_ui
+        draw_ui_cached
         modal_draw "Administrator Password" 66 12
         modal_center_text 3 "Administrator access is required to continue."
 
@@ -2199,7 +2304,7 @@ request_sudo_dialog() {
         if ! read_masked_password "$field_x" "$field_y" "$field_width" sudo_password; then
             sudo_password=""
             STATUS_MESSAGE="Administrator request cancelled"
-            draw_ui
+            draw_ui_cached
             return 1
         fi
 
@@ -2212,7 +2317,7 @@ request_sudo_dialog() {
         sudo_password=""
         ((attempts++))
 
-        draw_ui
+        draw_ui_cached
         modal_draw "Incorrect Password" 56 9
         modal_center_text 3 "The password was not accepted."
         if ((attempts < 3)); then
@@ -2230,7 +2335,7 @@ request_sudo_dialog() {
     done
 
     STATUS_MESSAGE="Administrator authentication failed"
-    draw_ui
+    draw_ui_cached
     return 1
 }
 
@@ -2519,13 +2624,17 @@ run_apt_ide_progress() {
     shift 2
 
     local tempdir
-    local pipe
-    local logfile
+    local status_pipe
+    local output_pipe
+    local output_log
 
     tempdir=$(mktemp -d)
-    pipe="$tempdir/progress.pipe"
-    logfile="$tempdir/apt-error.log"
-    mkfifo "$pipe"
+    status_pipe="$tempdir/status.pipe"
+    output_pipe="$tempdir/output.pipe"
+    output_log="$tempdir/apt-output.log"
+
+    mkfifo "$status_pipe" "$output_pipe"
+    : > "$output_log"
 
     update_history_clear
     UPDATE_CURRENT_ACTION="Starting APT..."
@@ -2536,32 +2645,69 @@ run_apt_ide_progress() {
     draw_update_current
     draw_update_percent_bar 0
 
-    # Open the FIFO read/write so the Bash reader never blocks while
-    # waiting for apt-get to open or close its end of the pipe.
-    exec 8<>"$pipe"
+    # Keep both FIFO read ends open in the parent. Opening them read/write
+    # prevents startup races while sudo/bash/apt-get opens the writer ends.
+    exec 8<>"$status_pipe"
+    exec 9<>"$output_pipe"
 
-    # APT::Status-Fd produces pmstatus/dlstatus records containing a
-    # real total percentage plus a human-readable current action.
-    # We use stdout (fd 1), which avoids sudo closing a custom fd > 2.
+    # IMPORTANT:
+    # Do not use fd 1 (stdout) as APT::Status-Fd. dpkg and package
+    # maintainer scripts need normal stdout and can fail with errors such as:
+    #
+    #   couldn't close stdout: Bad file descriptor
+    #   dpkg: error writing to status fd ...
+    #
+    # sudo normally closes inherited descriptors above 2. To avoid that,
+    # start a root Bash first, then open fd 3 *inside* that root shell.
+    # APT/dpkg machine progress goes to fd 3, while normal stdout/stderr
+    # goes to a separate FIFO for the live activity/history display.
     log_append "APT command: apt-get $*"
 
-    sudo -n apt-get \
-        -o APT::Status-Fd=1 \
-        -o Dpkg::Progress-Fancy=0 \
-        -o Dpkg::Use-Pty=0 \
-        "$@" \
-        </dev/null \
-        >"$pipe" \
-        2>"$logfile" &
+    sudo -n bash -c '
+        status_pipe=$1
+        output_pipe=$2
+        shift 2
+
+        exec 3>"$status_pipe"
+
+        exec apt-get \
+            -o APT::Status-Fd=3 \
+            -o Dpkg::Progress-Fancy=0 \
+            -o Dpkg::Use-Pty=0 \
+            "$@" \
+            >"$output_pipe" \
+            2>&1
+    ' bash "$status_pipe" "$output_pipe" "$@" &
 
     local pid=$!
     local line=""
+    local got_line=0
 
+    # Read both streams while APT is active.
+    # fd 8: machine-readable pmstatus/dlstatus progress
+    # fd 9: normal apt/dpkg output shown in the history area
     while kill -0 "$pid" 2>/dev/null; do
 
-        if IFS= read -r -t 0.10 line <&8; then
-            log_append "$line"
-            parse_apt_progress_line "$line"
+        got_line=0
+
+        if IFS= read -r -t 0.05 line <&8; then
+            [[ -z "$line" ]] || {
+                log_append "status: $line"
+                parse_apt_progress_line "$line"
+                got_line=1
+            }
+        fi
+
+        if IFS= read -r -t 0.05 line <&9; then
+            [[ -z "$line" ]] || {
+                printf '%s\n' "$line" >> "$output_log"
+                log_append "$line"
+                parse_apt_progress_line "$line"
+                got_line=1
+            }
+        fi
+
+        if ((got_line == 1)); then
             draw_update_history
             draw_update_current
             draw_update_percent_bar "$UPDATE_PERCENT"
@@ -2569,8 +2715,16 @@ run_apt_ide_progress() {
 
     done
 
-    # Drain any final lines written just before apt exited.
+    # Drain anything written immediately before apt-get exited.
     while IFS= read -r -t 0.02 line <&8; do
+        [[ -z "$line" ]] && continue
+        log_append "status: $line"
+        parse_apt_progress_line "$line"
+    done
+
+    while IFS= read -r -t 0.02 line <&9; do
+        [[ -z "$line" ]] && continue
+        printf '%s\n' "$line" >> "$output_log"
         log_append "$line"
         parse_apt_progress_line "$line"
     done
@@ -2579,15 +2733,10 @@ run_apt_ide_progress() {
     local result=$?
 
     exec 8>&-
+    exec 9>&-
 
     draw_update_history
     draw_update_current
-
-    if [[ -s "$logfile" ]]; then
-        while IFS= read -r line; do
-            log_append "stderr: $line"
-        done < "$logfile"
-    fi
 
     if ((result == 0)); then
         UPDATE_PERCENT=100
@@ -2595,11 +2744,16 @@ run_apt_ide_progress() {
         LAST_UPDATE_ERROR=""
         log_append "APT command completed successfully."
     else
-        LAST_UPDATE_ERROR=$(tail -8 "$logfile" | tr '\n' ' ' | sed 's/[[:space:]][[:space:]]*/ /g')
+        LAST_UPDATE_ERROR=$(
+            tail -8 "$output_log" 2>/dev/null |
+                tr '\n' ' ' |
+                sed 's/[[:space:]][[:space:]]*/ /g'
+        )
 
         if [[ -z "$LAST_UPDATE_ERROR" && ${#UPDATE_HISTORY[@]} -gt 0 ]]; then
             LAST_UPDATE_ERROR="${UPDATE_HISTORY[-1]}"
         fi
+
         log_append "APT command failed with exit code $result."
     fi
 
@@ -3270,7 +3424,7 @@ browse_rollbacks() {
         ((selected < top)) && top=$selected
         ((selected >= top + visible)) && top=$((selected - visible + 1))
 
-        draw_ui
+        draw_ui_cached
         modal_draw "Rollback Transactions" 82 16
         modal_text 3 0 "Select a saved package transaction."
 
@@ -3312,7 +3466,7 @@ browse_rollbacks() {
                 rollback_transaction "${dirs[$selected]}"
                 ;;
             $'\e')
-                draw_ui
+                draw_ui_cached
                 return
                 ;;
         esac
@@ -3321,7 +3475,7 @@ browse_rollbacks() {
 
 show_update_error() {
     local detail="${LAST_UPDATE_ERROR:-No additional details were returned.}"
-    draw_ui
+    draw_ui_cached
     modal_draw "Update Error" 72 11
     modal_center_text 3 "The update process did not complete successfully."
     modal_center_text 5 "$(trim_text "$detail" 60)"
@@ -3335,7 +3489,7 @@ show_update_error() {
     done
 
     STATUS_MESSAGE="Update failed"
-    draw_ui
+    draw_ui_cached
 }
 
 # ------------------------------------------------------------
@@ -3383,6 +3537,26 @@ maybe_offer_reboot() {
 # ------------------------------------------------------------
 # UPDATE ACTIONS
 # ------------------------------------------------------------
+refresh_cached_update_counts() {
+    local upgradable package_count security_count
+
+    if ! command -v apt >/dev/null 2>&1; then
+        LAST_PACKAGE_UPDATE_COUNT="Unknown"
+        LAST_SECURITY_UPDATE_COUNT="Unknown"
+        LAST_UPDATE_CHECK_TIME=$(date '+%H:%M:%S')
+        return
+    fi
+
+    # Run apt list once and derive both counts from the same output.
+    upgradable=$(apt list --upgradable 2>/dev/null | tail -n +2)
+    package_count=$(grep -c . <<< "$upgradable")
+    security_count=$(grep -Ei -- '-security|security' <<< "$upgradable" | wc -l)
+
+    LAST_PACKAGE_UPDATE_COUNT="${package_count:-0} available"
+    LAST_SECURITY_UPDATE_COUNT="${security_count:-0} available"
+    LAST_UPDATE_CHECK_TIME=$(date '+%H:%M:%S')
+}
+
 check_for_updates() {
     if ! request_sudo_dialog; then
         return
@@ -3413,14 +3587,16 @@ check_for_updates() {
             fwupdmgr --assume-yes refresh || true
     fi
 
-    log_append "Available package updates: $(get_package_update_count)"
-    log_append "Security updates: $(get_security_update_count)"
-    log_append "Firmware status: $(get_firmware_status)"
-    log_append "Driver status: $(get_driver_status)"
+    refresh_cached_update_counts
+    log_append "Available package updates: $LAST_PACKAGE_UPDATE_COUNT"
+    log_append "Security updates: $LAST_SECURITY_UPDATE_COUNT"
+    log_append "Firmware status: use F to check/install firmware"
+    log_append "Driver status: use D to check/install drivers"
     end_operation_log "success"
 
+    invalidate_maintenance_caches
     STATUS_MESSAGE="Update check complete - log saved"
-    draw_ui
+    draw_ui_cached
 }
 
 update_system_packages() {
@@ -3471,10 +3647,14 @@ update_system_packages() {
 
     finish_transaction "success" "yes"
     log_append "Package changes recorded: $(wc -l < "$CURRENT_TXN_DIR/changes.tsv" 2>/dev/null || echo 0)"
+    LAST_PACKAGE_UPDATE_COUNT="0 available"
+    LAST_SECURITY_UPDATE_COUNT="0 available"
+    LAST_UPDATE_CHECK_TIME=$(date '+%H:%M:%S')
     end_operation_log "success"
 
+    invalidate_maintenance_caches
     STATUS_MESSAGE="Ubuntu update complete - log and rollback snapshot saved"
-    draw_ui
+    draw_ui_cached
     maybe_offer_reboot
 }
 
@@ -3620,7 +3800,7 @@ handle_resize() {
         return
     fi
 
-    draw_ui
+    draw_ui_cached
 }
 
 trap handle_resize WINCH
@@ -3644,7 +3824,7 @@ read_key() {
     # allows a bare ESC key to work in modal windows.
     for ((i=0; i<7; i++)); do
         char=""
-        IFS= read -r -n1 -t 0.04 char || break
+        IFS= read -r -n1 -t 0.015 char || break
         sequence+="$char"
 
         if [[ "$char" =~ [A-Za-z~] ]]; then
@@ -3669,12 +3849,7 @@ while true; do
             if ((SELECTED < 0)); then
                 SELECTED=$((${#MENU_ITEMS[@]} - 1))
             fi
-            INFO_OFFSET=0
-            STATUS_MESSAGE="Viewing ${MENU_ITEMS[$SELECTED]}"
-            draw_menu
-            draw_information
-            draw_status
-            draw_shortcuts
+            show_selected_page_auto
             ;;
 
         $'\e[B'|$'\eOB')
@@ -3682,12 +3857,7 @@ while true; do
             if ((SELECTED >= ${#MENU_ITEMS[@]})); then
                 SELECTED=0
             fi
-            INFO_OFFSET=0
-            STATUS_MESSAGE="Viewing ${MENU_ITEMS[$SELECTED]}"
-            draw_menu
-            draw_information
-            draw_status
-            draw_shortcuts
+            show_selected_page_auto
             ;;
 
         ""|$'\n'|$'\r')
